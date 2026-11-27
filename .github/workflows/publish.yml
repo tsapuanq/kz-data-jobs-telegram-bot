@@ -11,7 +11,7 @@ on:
 jobs:
   run_full_pipeline:
     name: Run Main Pipeline
-    runs-on: ubuntu-latest 
+    runs-on: ubuntu-24.04 
 
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
