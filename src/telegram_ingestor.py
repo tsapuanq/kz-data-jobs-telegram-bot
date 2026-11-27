@@ -25,6 +25,7 @@ from src.config import (
     TELEGRAM_API_ID,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_DELAY_SECONDS,
+    TELEGRAM_GPT_MAX_ATTEMPTS,
     TELEGRAM_LOOKBACK_DAYS,
     TELEGRAM_MAX_DELAY_SECONDS,
     TELEGRAM_PHOTO_OCR_DETAIL,
@@ -44,6 +45,7 @@ from src.utils import setup_logger
 try:
     from telethon import TelegramClient
     from telethon.sessions import StringSession
+    from telethon.tl.types import MessageMediaWebPage, WebPage
 except ImportError as exc:
     raise RuntimeError(
         "Telethon is required for Telegram source ingestion. Install: python3 -m pip install telethon"
@@ -76,6 +78,8 @@ GPT_PROMPT_TEMPLATE = """\
 4. Не копируй исходный текст дословно.
 5. Не выдумывай факты. Если поля нет, пиши "Не указано".
 6. Не добавляй ссылку на исходный Telegram-канал и не упоминай, откуда взят пост.
+7. Сохрани способ откликнуться: ссылку на вакансию, контакт рекрутера, email — если они есть
+   в посте, в тексте с изображения или в превью ссылки.
 
 Подходящие направления:
 - Data Scientist
@@ -83,7 +87,7 @@ GPT_PROMPT_TEMPLATE = """\
 - Data Analyst / BI Analyst
 - Data Engineer / Big Data / DWH / ETL
 - DevOps / MLOps
-- System Analyst
+- System Analyst / Business Analyst / Product Analyst
 
 Неподходящие посты:
 - новости, статьи, курсы, митапы, мемы;
@@ -107,7 +111,7 @@ GPT_PROMPT_TEMPLATE = """\
 
 Источник для внутренней дедупликации, не добавлять в публикацию: {source_url}
 
-Сырой пост:
+Сырой пост (может включать блоки [Текст с изображения] и [Превью ссылки]):
 {raw_text}
 """
 
@@ -216,16 +220,55 @@ def extract_text_from_photo(image_bytes: bytes) -> str:
     return openai_responses_call(build_photo_ocr_input(image_bytes), model=OPENAI_VISION_MODEL).strip()
 
 
-def combine_caption_and_photo_text(caption: str, photo_text: str) -> tuple[str, str]:
-    caption = caption.strip()
-    photo_text = photo_text.strip()
-    if caption and photo_text:
-        return f"{caption}\n\n[Текст с изображения]\n{photo_text}", "caption_and_photo_ocr"
-    if photo_text:
-        return photo_text, "photo_ocr"
-    if caption:
-        return caption, "text"
-    return "", "empty"
+# Превью ссылки с коротким текстом: картинка превью может быть единственным носителем вакансии
+# (например, баннер поста LinkedIn). При длинном тексте это обычно логотип — OCR не нужен.
+LINK_PREVIEW_OCR_MAX_TEXT = 300
+
+
+def link_preview_text(message) -> str:
+    media = getattr(message, "media", None)
+    if not isinstance(media, MessageMediaWebPage) or not isinstance(media.webpage, WebPage):
+        return ""
+    webpage = media.webpage
+    lines = [str(x).strip() for x in (webpage.site_name, webpage.title, webpage.description) if x and str(x).strip()]
+    if not lines:
+        return ""
+    return "\n".join([f"Ссылка: {webpage.url}", *lines])
+
+
+def ocr_target(message, text_len: int) -> str | None:
+    """Что распознавать: "photo" — фото/картинка файлом, "link_preview" — картинка превью, None — ничего."""
+    media = getattr(message, "media", None)
+    if isinstance(media, MessageMediaWebPage):
+        if getattr(message, "photo", None) and text_len < LINK_PREVIEW_OCR_MAX_TEXT:
+            return "link_preview"
+        return None
+    if getattr(message, "photo", None):
+        return "photo"
+    document = getattr(message, "document", None)
+    if (
+        document is not None
+        and (getattr(document, "mime_type", "") or "").startswith("image/")
+        and not getattr(message, "sticker", None)
+        and not getattr(message, "gif", None)
+    ):
+        return "photo"
+    return None
+
+
+def combine_post_parts(caption: str, photo_text: str, preview_text: str) -> tuple[str, str]:
+    """Собирает текст поста для GPT и тип источника вида "text+photo_ocr+link_preview"."""
+    parts, kinds = [], []
+    if caption.strip():
+        parts.append(caption.strip())
+        kinds.append("text")
+    if photo_text.strip():
+        parts.append(f"[Текст с изображения]\n{photo_text.strip()}")
+        kinds.append("photo_ocr")
+    if preview_text.strip():
+        parts.append(f"[Превью ссылки]\n{preview_text.strip()}")
+        kinds.append("link_preview")
+    return "\n\n".join(parts), "+".join(kinds) or "empty"
 
 
 def ensure_schema(db: Database) -> None:
@@ -262,6 +305,12 @@ def ensure_schema(db: Database) -> None:
             ADD COLUMN IF NOT EXISTS raw_source_type TEXT NOT NULL DEFAULT 'text';
             """
         )
+        cursor.execute(
+            """
+            ALTER TABLE telegram_posts
+            ADD COLUMN IF NOT EXISTS gpt_attempts INTEGER NOT NULL DEFAULT 0;
+            """
+        )
         conn.commit()
     finally:
         if cursor:
@@ -275,7 +324,9 @@ async def read_source_posts(
     limit: int,
     lookback_days: int,
     session_string: str | None,
+    known_urls: set[str],
 ) -> list[TelegramSourcePost]:
+    """Читает новые посты канала. Посты из known_urls уже в БД — их не скачиваем и не распознаём повторно."""
     if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
         raise RuntimeError("TELEGRAM_API_ID and TELEGRAM_API_HASH are required")
     if not session_string and os.getenv("GITHUB_ACTIONS") == "true":
@@ -308,31 +359,31 @@ async def read_source_posts(
         async for message in client.iter_messages(entity, limit=limit):
             if message.date and message.date < cutoff:
                 continue
+            post_url = f"https://t.me/{channel.lstrip('@')}/{message.id}"
+            if post_url in known_urls:
+                continue
+
             caption = (message.message or "").strip()
-            text = caption
-            raw_source_type = "text" if caption else "empty"
-
-            if TELEGRAM_PHOTO_OCR_ENABLED and getattr(message, "photo", None):
-                should_ocr = (not caption) or TELEGRAM_PHOTO_OCR_WITH_CAPTION
-                if should_ocr and photo_ocr_count < TELEGRAM_PHOTO_OCR_LIMIT_PER_RUN:
-                    try:
-                        photo_bytes = await message.download_media(bytes)
-                        photo_ocr_count += 1
-                        photo_text = extract_text_from_photo(photo_bytes or b"")
-                        text, raw_source_type = combine_caption_and_photo_text(caption, photo_text)
-                    except Exception as exc:
-                        logging.warning(
-                            "[Telegram OCR] Failed for message_id=%s: %s",
-                            getattr(message, "id", "unknown"),
-                            exc,
-                        )
-                        text, raw_source_type = combine_caption_and_photo_text(caption, "")
-                elif should_ocr:
+            preview_text = link_preview_text(message)
+            photo_text = ""
+            target = ocr_target(message, len(caption) + len(preview_text)) if TELEGRAM_PHOTO_OCR_ENABLED else None
+            if target == "photo" and caption and not TELEGRAM_PHOTO_OCR_WITH_CAPTION:
+                target = None
+            if target and photo_ocr_count >= TELEGRAM_PHOTO_OCR_LIMIT_PER_RUN:
+                logging.info("[Telegram OCR] Per-run OCR limit reached, skipping message_id=%s", message.id)
+                target = None
+            if target:
+                photo_ocr_count += 1
+                try:
+                    photo_bytes = await message.download_media(bytes)
+                    photo_text = extract_text_from_photo(photo_bytes or b"")
                     logging.info(
-                        "[Telegram OCR] Per-run OCR limit reached, skipping photo OCR for message_id=%s",
-                        getattr(message, "id", "unknown"),
+                        "[Telegram OCR] message_id=%s (%s): %s chars", message.id, target, len(photo_text)
                     )
+                except Exception as exc:
+                    logging.warning("[Telegram OCR] Failed for message_id=%s: %s", message.id, exc)
 
+            text, raw_source_type = combine_post_parts(caption, photo_text, preview_text)
             if not text:
                 continue
             posts.append(
@@ -347,6 +398,16 @@ async def read_source_posts(
         return list(reversed(posts))
     finally:
         await client.disconnect()
+
+
+def load_known_source_urls(db: Database, source_channel: str) -> set[str]:
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT source_url FROM telegram_posts WHERE source_channel = %s", (source_channel,))
+            return {row[0] for row in cursor.fetchall()}
+    finally:
+        db.return_connection(conn)
 
 
 def save_raw_posts(db: Database, posts: list[TelegramSourcePost]) -> int:
@@ -401,26 +462,29 @@ def process_unprocessed_posts(db: Database, limit: int) -> int:
             SELECT id, source_url, raw_text
             FROM telegram_posts
             WHERE gpt_result_json IS NULL
+            AND gpt_attempts < %s
             ORDER BY published_at NULLS LAST, id
             LIMIT %s
             """,
-            (limit,),
+            (TELEGRAM_GPT_MAX_ATTEMPTS, limit),
         )
         rows = cursor.fetchall()
         for row in rows:
             raw_response = openai_api_call(build_gpt_prompt(dict(row)))
-            if not raw_response:
-                logging.warning("[Telegram GPT] Empty response for %s", row["source_url"])
-                continue
             try:
+                if not raw_response:
+                    raise ValueError("empty response")
                 result = parse_gpt_result(raw_response)
             except Exception as exc:
+                # Считаем неудачи: пост с вечной ошибкой не должен занимать лимит каждого запуска.
                 logging.warning(
-                    "[Telegram GPT] Invalid JSON for %s: %s\n%s",
-                    row["source_url"],
-                    exc,
-                    raw_response,
+                    "[Telegram GPT] Bad response for %s: %s\n%s", row["source_url"], exc, raw_response
                 )
+                cursor.execute(
+                    "UPDATE telegram_posts SET gpt_attempts = gpt_attempts + 1 WHERE id = %s",
+                    (row["id"],),
+                )
+                conn.commit()
                 continue
 
             publish_text = None
@@ -517,9 +581,6 @@ async def run_telegram_ingestor(db: Database, publish: bool = True) -> None:
     if not TELEGRAM_SOURCE_CHANNEL:
         logging.info("[Telegram Source] TELEGRAM_SOURCE_CHANNEL is not set, skipping.")
         return
-    if publish and (not TELEGRAM_BOT_TOKEN or not CHANNEL_USERNAME):
-        logging.info("[Telegram Source] TELEGRAM_BOT_TOKEN or CHANNEL_USERNAME is not set, skipping publish.")
-        return
 
     ensure_schema(db)
     posts = await read_source_posts(
@@ -527,6 +588,7 @@ async def run_telegram_ingestor(db: Database, publish: bool = True) -> None:
         limit=TELEGRAM_SOURCE_LIMIT,
         lookback_days=TELEGRAM_LOOKBACK_DAYS,
         session_string=TELEGRAM_SESSION_STRING,
+        known_urls=load_known_source_urls(db, normalize_channel(TELEGRAM_SOURCE_CHANNEL)),
     )
     logging.info("[Telegram Source] Read %s posts from source channel.", len(posts))
     saved = save_raw_posts(db, posts)
@@ -537,5 +599,7 @@ async def run_telegram_ingestor(db: Database, publish: bool = True) -> None:
         logging.info("[Telegram Source] Publish disabled, leaving approved posts unsent.")
         return
 
-    sent = await publish_approved_posts(db, CHANNEL_USERNAME or "", TELEGRAM_BOT_TOKEN or "")
+    if not TELEGRAM_BOT_TOKEN or not CHANNEL_USERNAME:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN and CHANNEL_USERNAME are required to publish")
+    sent = await publish_approved_posts(db, CHANNEL_USERNAME, TELEGRAM_BOT_TOKEN)
     logging.info("[Telegram Source] Published %s approved posts.", sent)

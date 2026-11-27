@@ -13,17 +13,6 @@ def setup_logger():
         logging.debug("Логгер уже настроен, пропускаем.")
 
 
-def canonical_link(link: str) -> str | None:
-    if not isinstance(link, str) or not link.strip():
-        return None
-    try:
-        return link.split("?", 1)[0].strip()  
-    except Exception:
-        return (
-            link.strip() if isinstance(link, str) else None
-        )  
-
-
 def extract_vacancy_id(link: str) -> str | None:
     """Извлекает ID вакансии из URL."""
     if not isinstance(link, str) or not link.strip():
@@ -53,7 +42,8 @@ TARGET_KEYWORDS_FINAL = [
     "cloud engineer", "data analytics", "data analysis",
     "power bi", "powerbi", "junior analyst",
 
-    "mlops", "mlops engineer", "devops", "devops engineer"
+    "mlops", "mlops engineer", "devops", "devops engineer",
+    "product analyst", "продуктов аналит", "бизнес аналит", "системн аналит"
 ]
 
 BASE_KEYWORDS_ROOT = [
@@ -135,9 +125,28 @@ def normalize_text(text: str) -> str:
     if not text:
         return ""
     
-    text = re.sub(r'[^a-zа-я0-9]+', ' ', text.lower())
+    text = re.sub(r'[^a-zа-яё0-9]+', ' ', text.lower())
 
     return re.sub(r'\s+', ' ', text).strip()
+
+
+_PATTERN_CACHE: dict[str, re.Pattern] = {}
+
+
+def _contains(text: str, keyword: str) -> bool:
+    """
+    Ищет ключ с начала слова, а не как подстроку: "hr" не должен находиться в "through",
+    "ml" — в "html". Короткие ключи (до 3 символов) — только целым словом, длинные — как
+    начало слова, чтобы работали основы вроде "аналит" или "машинн обуч".
+    """
+    pattern = _PATTERN_CACHE.get(keyword)
+    if pattern is None:
+        # Каждая часть — начало слова: "машинн обуч" находит "машинное обучение".
+        body = r"[a-zа-яё0-9]*\s+".join(re.escape(part) for part in keyword.split())
+        tail = r"(?![a-zа-яё0-9])" if len(keyword) <= 3 else ""
+        pattern = re.compile(rf"(?<![a-zа-яё0-9]){body}{tail}")
+        _PATTERN_CACHE[keyword] = pattern
+    return bool(pattern.search(text))
 
 
 def _calculate_relevance_score(text: str) -> Tuple[int, List[str]]:
@@ -148,21 +157,24 @@ def _calculate_relevance_score(text: str) -> Tuple[int, List[str]]:
     signals: List[str] = []
 
     for keyword, weight in KEYWORD_WEIGHTS.items():
-        if keyword in text:
+        if _contains(text, keyword):
             score += weight
             signals.append(f"{keyword}:{weight}")
 
     for combo, bonus in BONUS_PHRASE_COMBOS:
-        if all(term in text for term in combo):
+        if all(_contains(text, term) for term in combo):
             score += bonus
             signals.append(f"{'+'.join(combo)}:{bonus}")
 
     return score, signals
 
 def is_relevant_soft(title: str, description: Optional[str]) -> bool:
-    text = normalize_text(title + " " + (description or ""))
+    title_text = normalize_text(title)
+    text = normalize_text((title or "") + " " + (description or ""))
 
-    if any(word in text for word in DENY_WORDS_ROOT):
+    # Стоп-слова проверяем только в названии: "HR" или "продаж" в описании
+    # data-вакансии не делают её нерелевантной.
+    if any(_contains(title_text, word) for word in DENY_WORDS_ROOT):
         return False
 
     score, signals = _calculate_relevance_score(text)
@@ -172,13 +184,13 @@ def is_relevant_soft(title: str, description: Optional[str]) -> bool:
         )
         return True
 
-    if any(word in text for word in TARGET_KEYWORDS_FINAL):
+    if any(_contains(text, word) for word in TARGET_KEYWORDS_FINAL):
         logging.debug(f"[SoftFilter] target keyword match for {title}")
         return True
 
     base_matches = sum(
         1 for word in BASE_KEYWORDS_ROOT
-        if word in text
+        if _contains(text, word)
     )
 
     return base_matches >= 2

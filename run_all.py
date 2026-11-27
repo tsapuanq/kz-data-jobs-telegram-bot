@@ -1,40 +1,44 @@
 # run_all.py
-import asyncio
 import logging
-from src.run_scraper import run_scraper
-from src.publisher import run_publisher
-from src.utils import setup_logger
-from database import Database
 import os
+import sys
+
+from database import Database
+from src.publisher import run_publisher
+from src.run_scraper import run_scraper
+from src.utils import setup_logger
 
 if __name__ == "__main__":
     setup_logger()
 
     db = None
-    scraper_ok = False
+    failed = False
     try:
         logging.info("🚀 Запуск основного пайплайна...")
         db = Database(os.getenv("DATABASE_URL"))
 
-        logging.info("[STEP 1/2] Scraping raw data...")
+        logging.info("[STEP 1/2] Scraping hh...")
         try:
-            asyncio.run(run_scraper(db))
-            scraper_ok = True
+            run_scraper(db)
         except Exception as e:
+            failed = True
             logging.critical(f"❌ Ошибка скрейпера: {e}", exc_info=True)
 
-        if scraper_ok:
-            logging.info("[STEP 2/2] Publishing to Telegram...")
-            try:
-                run_publisher(db)
-            except Exception as e:
-                logging.critical(f"❌ Ошибка публикации: {e}", exc_info=True)
-
-        logging.info("✅ Pipeline completed.")
+        # Публикация работает и при сбое скрейпера: уже собранные вакансии всё равно уйдут в канал.
+        logging.info("[STEP 2/2] Publishing to Telegram...")
+        try:
+            run_publisher(db)
+        except Exception as e:
+            failed = True
+            logging.critical(f"❌ Ошибка публикации: {e}", exc_info=True)
 
     except Exception as e:
+        failed = True
         logging.critical(f"❌ Критическая ошибка инициализации: {e}", exc_info=True)
     finally:
         if db:
             db.close_all()
-            logging.info("Соединения БД закрыты.")
+
+    if failed:
+        sys.exit(1)
+    logging.info("✅ Pipeline completed.")

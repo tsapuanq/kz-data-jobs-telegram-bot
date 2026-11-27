@@ -1,213 +1,228 @@
+# scraper.py
+"""Детали вакансии hh из встроенного JSON страницы (vacancyView.vacancyFull.vacancy).
+
+Значения переводятся в тот же вид, в котором они уже хранятся в таблице vacancies
+(«1–3 года», «5/2», «от 500 000 ₸ за месяц, на руки»), чтобы не ломать аналитику.
+"""
 import logging
 import re
+from datetime import datetime
+from html.parser import HTMLParser
+from zoneinfo import ZoneInfo
 
-from src.cleaning import (
-    clean_text_safe,
-    parse_russian_date,
-    normalize_city_name,
-    extract_salary_range_with_currency,
-    clean_skills,
-    clean_working_hours,
-    clean_work_format,
-    clean_schedule
-)
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from src.config import SCRAPER_TIMEOUT_GOTO, SCRAPER_TIMEOUT_SELECTOR
+import requests
+
+from src.config import HH_BASE_URL, LOCAL_TIMEZONE
+from src.parser import fetch_state, parse_hh_datetime
+
+NOT_SPECIFIED = "Не указано"
+
+EXPERIENCE = {
+    "noExperience": "не требуется",
+    "between1And3": "1–3 года",
+    "between3And6": "3–6 лет",
+    "moreThan6": "более 6 лет",
+}
+EMPLOYMENT = {
+    "FULL": "Полная занятость",
+    "PART": "Частичная занятость",
+    "PROJECT": "Проектная работа",
+    "SIDE_JOB": "Подработка",
+    "FLY_IN_FLY_OUT": "Вахта",
+}
+WORK_FORMATS = {
+    "ON_SITE": "на месте работодателя",
+    "REMOTE": "удалённо",
+    "HYBRID": "гибрид",
+    "FIELD_WORK": "разъездной",
+}
+SCHEDULE_WORDS = {"FLEXIBLE": "свободный", "WEEKEND": "по выходным", "OTHER": "другое"}
+HOURS_WORDS = {"FLEXIBLE": "по договорённости", "OTHER": "другое"}
+CURRENCIES = {"KZT": "₸", "RUR": "₽", "RUB": "₽", "USD": "$", "EUR": "€", "UZS": "сум", "KGS": "сом"}
+SALARY_MODES = {"MONTH": "за месяц", "SHIFT": "за смену", "HOUR": "за час", "FLY_IN_FLY_OUT": "за вахту"}
+MONTHS = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
 
 
-def _is_missing(value: str | None) -> bool:
-    if not isinstance(value, str):
-        return True
-    value = value.strip()
-    return not value or value.lower() == "не указано"
+def vacancy_url(vacancy_id: int | str) -> str:
+    return f"{HH_BASE_URL}/vacancy/{vacancy_id}"
 
 
-def _clean_hh_title(value: str | None) -> str:
-    title = clean_text_safe(value)
-    if not title:
+class _HtmlToText(HTMLParser):
+    """Описание hh приходит HTML-ом: сохраняем абзацы и пункты списков."""
+
+    BLOCK_TAGS = {"p", "div", "br", "ul", "ol", "h1", "h2", "h3", "h4"}
+
+    def __init__(self):
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "li":
+            self.parts.append("\n• ")
+        elif tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+
+def html_to_text(value: str | None) -> str:
+    if not value:
         return ""
-
-    title = re.sub(r"^вакансия\s+", "", title, flags=re.IGNORECASE).strip()
-    title = re.split(r"\s+[—-]\s+hh\.", title, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-    title = re.split(r"\s+\|\s+hh\.", title, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-    return title
-
-
-async def _first_visible_text(page, selectors: tuple[str, ...], timeout: int = 3000) -> str:
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            if await locator.count() == 0:
-                continue
-            text = await locator.inner_text(timeout=timeout)
-            text = clean_text_safe(text)
-            if text:
-                return text
-        except Exception:
-            continue
-    return ""
+    parser = _HtmlToText()
+    parser.feed(value)
+    text = "".join(parser.parts).replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-async def _first_meta_content(page, selectors: tuple[str, ...]) -> str:
-    for selector in selectors:
-        try:
-            content = await page.locator(selector).first.get_attribute("content", timeout=1000)
-            content = clean_text_safe(content)
-            if content:
-                return content
-        except Exception:
-            continue
-    return ""
+def _codes(value) -> list[str]:
+    """hh отдаёт списки кодов то списком, то {"...Element": [...]} — приводим к списку."""
+    if isinstance(value, dict):
+        value = next(iter(value.values()), [])
+    if isinstance(value, str):
+        return [value]
+    return [v for v in (value or []) if isinstance(v, str)]
 
 
-async def extract_vacancy_title(page) -> str:
-    title = await _first_visible_text(
-        page,
-        (
-            'h1[data-qa="vacancy-title"]',
-            '[data-qa="vacancy-title"]',
-            "main h1",
-            "h1",
-        ),
-    )
-    if title:
-        return _clean_hh_title(title)
-
-    title = await _first_meta_content(
-        page,
-        (
-            'meta[property="og:title"]',
-            'meta[name="twitter:title"]',
-            'meta[name="title"]',
-        ),
-    )
-    if title:
-        return _clean_hh_title(title)
-
-    try:
-        return _clean_hh_title(await page.title())
-    except Exception:
-        return ""
+def _join_ru(items: list[str]) -> str:
+    """["5/2", "свободный"] → "5/2 или свободный"; три и больше — через запятую."""
+    items = [i for i in items if i]
+    if not items:
+        return NOT_SPECIFIED
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " или " + items[-1]
 
 
-async def get_vacancy_details(link: str, page) -> dict | None:
-    try:
-        await page.goto(link, timeout=SCRAPER_TIMEOUT_GOTO, wait_until="domcontentloaded")
-    except PlaywrightTimeoutError:
-        logging.warning(f"[Vacancy Load] ⏳ Таймаут при загрузке страницы {link}")
+def format_schedule(value) -> str:
+    def one(code: str) -> str:
+        match = re.fullmatch(r"([A-Z]+)_ON_([A-Z]+)_OFF", code)
+        numbers = {"ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5, "SIX": 6, "SEVEN": 7}
+        if match and match.group(1) in numbers and match.group(2) in numbers:
+            return f"{numbers[match.group(1)]}/{numbers[match.group(2)]}"
+        return SCHEDULE_WORDS.get(code, code.lower())
+
+    return _join_ru([one(c) for c in _codes(value)])
+
+
+def format_working_hours(value) -> str:
+    def one(code: str) -> str:
+        match = re.fullmatch(r"HOURS_(\d+)", code)
+        return match.group(1) if match else HOURS_WORDS.get(code, code.lower())
+
+    return _join_ru([one(c) for c in _codes(value)])
+
+
+def format_work_format(value) -> str:
+    text = _join_ru([WORK_FORMATS.get(c, c.lower()) for c in _codes(value)])
+    return text[:1].upper() + text[1:] if text != NOT_SPECIFIED else text
+
+
+def _money(amount) -> str:
+    return f"{int(amount):,}".replace(",", " ")
+
+
+def format_salary(compensation: dict | None) -> tuple[str, str]:
+    """Возвращает (salary, salary_range) в формате, который уже лежит в БД."""
+    compensation = compensation or {}
+    low, high = compensation.get("from"), compensation.get("to")
+    if compensation.get("noCompensation") or (low is None and high is None):
+        return NOT_SPECIFIED, NOT_SPECIFIED
+
+    code = compensation.get("currencyCode") or ""
+    currency = CURRENCIES.get(code, code)
+    if low is not None and high is not None:
+        amount, short = f"от {_money(low)} до {_money(high)}", f"{int(low)}-{int(high)}"
+    elif low is not None:
+        amount, short = f"от {_money(low)}", f"от {int(low)}"
+    else:
+        amount, short = f"до {_money(high)}", f"до {int(high)}"
+
+    parts = [f"{amount} {currency}".strip()]
+    mode = SALARY_MODES.get(compensation.get("mode") or "")
+    if mode:
+        parts[0] += f" {mode}"
+    if compensation.get("gross") is True:
+        parts.append("до вычета налогов")
+    elif compensation.get("gross") is False:
+        parts.append("на руки")
+    return ", ".join(parts), f"{short} {currency}".strip()
+
+
+def to_local_date(value: str | None):
+    published = parse_hh_datetime(value)
+    if not published:
         return None
-    except Exception as e:
-        logging.warning(f"[Vacancy Load] ❌ Не удалось загрузить {link}: {e}")
+    return published.astimezone(ZoneInfo(LOCAL_TIMEZONE)).date()
+
+
+def format_ru_date(value) -> str:
+    return f"{value.day} {MONTHS[value.month - 1]} {value.year}" if value else ""
+
+
+def vacancy_to_row(vacancy: dict) -> dict | None:
+    """Переводит JSON вакансии hh в строку таблицы vacancies."""
+    description = html_to_text(vacancy.get("description"))
+    if not description:
         return None
 
+    published_at = to_local_date(vacancy.get("publicationTimeIso"))
+    salary, salary_range = format_salary(vacancy.get("compensation"))
+    employment = EMPLOYMENT.get(vacancy.get("employmentForm") or "", NOT_SPECIFIED)
+    if vacancy.get("internship"):
+        employment = f"{employment}\nСтажировка"
+    skills = [s.strip() for s in vacancy.get("keySkills") or [] if isinstance(s, str) and s.strip()]
+
+    return {
+        "title": (vacancy.get("name") or "").strip() or NOT_SPECIFIED,
+        "company": ((vacancy.get("company") or {}).get("name") or "").strip() or NOT_SPECIFIED,
+        "location": ((vacancy.get("area") or {}).get("name") or "").strip() or NOT_SPECIFIED,
+        "salary": salary,
+        "salary_range": salary_range,
+        "description": description,
+        "experience": EXPERIENCE.get(vacancy.get("workExperience") or "", NOT_SPECIFIED),
+        "employment_type": employment,
+        "schedule": format_schedule(vacancy.get("workScheduleByDays")),
+        "working_hours": format_working_hours(vacancy.get("workingHours")),
+        "work_format": format_work_format(vacancy.get("workFormats")),
+        "published_at": published_at,
+        "published_date": format_ru_date(published_at),
+        "skills": ", ".join(skills) if skills else NOT_SPECIFIED,
+        "url": vacancy_url(vacancy["vacancyId"]),
+    }
+
+
+def get_vacancy_details(session: requests.Session, vacancy_id: int) -> dict | None:
+    """Скачивает страницу вакансии. None — вакансию нельзя взять (архив, удалена, без описания)."""
+    url = vacancy_url(vacancy_id)
     try:
-        await page.wait_for_selector('h1[data-qa="vacancy-title"], h1', timeout=SCRAPER_TIMEOUT_SELECTOR)
-    except PlaywrightTimeoutError:
-        logging.warning(f"[Vacancy Load] ⏳ Таймаут ожидания h1, пробуем извлечь title из метаданных: {link}")
-
-    async def safe_inner_text(selector: str, default="Не указано") -> str:
-        try:
-            text = await page.inner_text(selector)
-            return clean_text_safe(text)
-        except PlaywrightTimeoutError:
-            return default
-        except Exception:
-            return default
-
-    try:
-        title_raw = await extract_vacancy_title(page)
-        company_raw = await safe_inner_text('a[data-qa="vacancy-company-name"]')
-        location_and_date_raw = await safe_inner_text(
-            "div[class*='magritte-text'][class*='typography-label']"
-        )
-
-        try:
-            elem = await page.query_selector("div:has-text('Вакансия опубликована')")
-            if elem:
-                text = await elem.inner_text()
-                match = re.search(r"(\d{1,2}\s+[а-я]+\s+\d{4})", text.lower())
-                published_date_raw = match.group(1) if match else None
-            else:
-                published_date_raw = None
-            published_at_parsed = parse_russian_date(published_date_raw)
-            print(f"🕓 RAW date: {published_date_raw} → parsed: {published_at_parsed}")
-        except Exception as e:
-            logging.warning(f"[Date Parse] ❌ Ошибка при извлечении даты: {e}")
-            published_date_raw, published_at_parsed = None, None
-
-        salary_raw = "Не указано"
-        salary_selectors = (
-            'span[data-qa="vacancy-salary-compensation-type-net"]',
-            'span[data-qa="vacancy-salary-compensation-type-gross"]',
-        )
-        for selector in salary_selectors:
-            candidate = await safe_inner_text(selector, default=None)
-            if candidate:
-                salary_raw = candidate
-                break
-        description_raw = await safe_inner_text('div[data-qa="vacancy-description"]')
-        experience_raw = await safe_inner_text('span[data-qa="vacancy-experience"]')
-        employment_type_raw = await safe_inner_text('div[data-qa="common-employment-text"]')
-        schedule_raw = await safe_inner_text('p[data-qa="work-schedule-by-days-text"]')
-        working_hours_raw = await safe_inner_text('div[data-qa="working-hours-text"]')
-        work_format_raw = await safe_inner_text('p[data-qa="work-formats-text"]')
-
-        skills_selector = '[data-qa="skills-element"]'
-        skills_elements = page.locator(skills_selector)
-        raw_skills_list = (
-            await skills_elements.all_inner_texts()
-            if await skills_elements.count() > 0
-            else []
-        )
-
-        city_raw = None
-        try:
-            sidebar_elems = await page.query_selector_all("[class*='magritte-text']")
-            for elem in sidebar_elems:
-                raw_text = (await elem.inner_text()).strip()
-                if "опубликована" in raw_text.lower():
-                    cleaned = re.sub(r"<!--.*?-->", "", raw_text)
-                    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-                    parts = cleaned.split(" ")
-                    city_raw = parts[-1] if parts else None
-                    break
-        except:
-            city_raw = None
-
-        location_cleaned = normalize_city_name(city_raw or "Не указано")
-
-        title_cleaned = clean_text_safe(title_raw)
-        description_cleaned = clean_text_safe(description_raw)
-
-        if _is_missing(title_cleaned):
-            title_cleaned = "Не указано"
-            logging.warning(f"[Vacancy Parse] ⚠️ Не удалось спарсить реальное название вакансии: {link}")
-
-        if _is_missing(description_cleaned):
-            logging.warning(f"[Vacancy Parse] ⚠️ Пропуск вакансии без описания: {link}")
+        state = fetch_state(session, url)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (404, 410):
+            logging.warning(f"[Vacancy] Недоступна ({e.response.status_code}): {url}")
             return None
+        raise
 
-        data = {
-            "title": title_cleaned,
-            "company": clean_text_safe(company_raw),
-            "location": location_cleaned,
-            "salary": clean_text_safe(salary_raw),
-            "salary_range": extract_salary_range_with_currency(salary_raw),
-            "description": description_cleaned,
-            "experience": clean_text_safe(experience_raw),
-            "employment_type": clean_text_safe(employment_type_raw),
-            "schedule": clean_schedule(schedule_raw),
-            "working_hours": clean_working_hours(working_hours_raw),
-            "work_format": clean_work_format(work_format_raw),
-            "published_at": published_at_parsed,
-            "published_date": clean_text_safe(published_date_raw),
-            "skills": clean_skills(",".join(raw_skills_list)),
-            "url": clean_text_safe(link.split("?", 1)[0]),
-        }
-
-        logging.info(f"[Vacancy Parsed] ✅ {data.get('title', 'Без названия')} — {data.get('company', 'Без компании')}")
-        return data
-
-    except Exception as e:
-        logging.warning(f"[Vacancy Parse] ❌ Ошибка при парсинге деталей {link}: {e}")
+    vacancy = ((state.get("vacancyView") or {}).get("vacancyFull") or {}).get("vacancy")
+    if not vacancy:
+        logging.warning(f"[Vacancy] На странице нет данных вакансии: {url}")
         return None
+    if (vacancy.get("status") or {}).get("archived"):
+        logging.info(f"[Vacancy] В архиве, пропускаем: {url}")
+        return None
+
+    row = vacancy_to_row(vacancy)
+    if row is None:
+        logging.warning(f"[Vacancy] Пропуск вакансии без описания: {url}")
+        return None
+    logging.info(f"[Vacancy] ✅ {row['title']} — {row['company']} ({row['location']})")
+    return row

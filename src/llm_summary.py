@@ -113,7 +113,7 @@ def openai_responses_call(input_payload, model: str | None = None) -> str:
             if text:
                 return text
 
-            logging.warning(f"[OpenAI] Пустой/нетипичный ответ API: {resp.text}")
+            logging.warning(f"[OpenAI] Пустой/нетипичный ответ API: {resp.text[:500]}")
             return ""
 
         except requests.exceptions.HTTPError as e:
@@ -263,7 +263,8 @@ FILTER_PROMPT = """
 Определи, относится ли вакансия К СТРОГО следующему списку профессий:
 Data Scientist, Machine Learning Engineer, Data Analyst, Data Engineer,
 Big Data Engineer, Data Architect, BI Analyst/Developer, DevOps Engineer,
-MLOps Engineer, System Analyst, AI/ML/NLP/CV Engineer, Researcher в области данных/ML.
+MLOps Engineer, System Analyst, Business Analyst, Product Analyst,
+AI/ML/NLP/CV Engineer, Researcher в области данных/ML.
 
 Если профессия НЕ относится — ответь "no".
 
